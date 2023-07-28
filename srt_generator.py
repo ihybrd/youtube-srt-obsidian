@@ -2,11 +2,20 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from deepmultilingualpunctuation import PunctuationModel
 import requests
 import json
-import os
+import sys
 
-ytb_link = input("YouTube link:")
-output_dir = input("Output Directory:")
-ytb_id = ytb_link.split("?")[1].split("=")[1]
+# arg1: script.py, arg2: youtube_link, arg3: output_dir
+if len(sys.argv) == 3:
+    ytb_link = sys.argv[1]
+    output_dir = sys.argv[2]
+else:
+    ytb_link = input("YouTube link:")
+    output_dir = input("Output Directory:")
+
+if "?" not in ytb_link: # short link
+    ytb_id = ytb_link.split("/")[-1]
+else:
+    ytb_id = ytb_link.split("?")[1].split("&")[0].split("=")[1]
 
 # download caption
 srt = YouTubeTranscriptApi.get_transcript(ytb_id)
