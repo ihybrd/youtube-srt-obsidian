@@ -1,5 +1,7 @@
 from youtube_transcript_api import YouTubeTranscriptApi
 from deepmultilingualpunctuation import PunctuationModel
+import requests
+import json
 import os
 
 ytb_link = input("YouTube link:")
@@ -15,6 +17,13 @@ def convert_seconds_to_HHMMSS(seconds):
     minutes = (seconds % 3600) // 60
     seconds = seconds % 60
     return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+def get_youtube_video_title(id):
+    url = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s" % id
+    r = requests.get(url)
+    j = json.loads(r.content)
+    return j['title'].replace(":", " - ").replace("/", "-")
+
 
 tmp = None
 tmp_t = None
@@ -37,7 +46,7 @@ for subtitle_id, line in enumerate(srt):
 
 # print(output)
 print("The output content is ready")
-output_file = output_dir + '/SRT.md'
+output_file = output_dir + '/SRT - %s.md' % get_youtube_video_title(ytb_id)
 with open(output_file , "w") as f:
     f.write(output)
 print("Finished: " + output_file)
