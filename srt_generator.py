@@ -51,7 +51,8 @@ for subtitle_id, line in enumerate(srt):
                 if block.startswith(" "):
                     _tmp += ". " + block[1].upper() + block[2:]
                 else:
-                    _tmp += block
+                    dot = "." if _tmp else ""
+                    _tmp += dot + block
             tmp = _tmp
             print(tmp)
             title = "# " + tmp_t.split("]")[0][1:] + "\n"
@@ -61,12 +62,13 @@ for subtitle_id, line in enumerate(srt):
     else:
         tmp += " " + subtitle
 
-header_info = "\n".join(["%s: %s" % (k, header[k]) for k in header])
+header['title'] = header['title'].replace(":", " - ").replace("/", "-")
+header_info = "\n".join(["%s: %s" % (k, header[k]) for k in header if k != 'html'])
 thumbnail_url = "![](%s)" % header['thumbnail_url']
 output = "---\n%s\n---\n%s\n" % (header_info, thumbnail_url) + output
 print("The output content is ready")
 
-output_file = output_dir + '/SRT - %s.md' % header['title'].replace(":", " - ").replace("/", "-")
+output_file = output_dir + '/SRT - %s.md' % header['title']
 with open(output_file , "w") as f:
     f.write(output)
 
