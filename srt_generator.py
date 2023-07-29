@@ -46,6 +46,13 @@ for subtitle_id, line in enumerate(srt):
         if tmp is not None:
             tmp = tmp_t + model.restore_punctuation(tmp)
             tmp = tmp[:-1] if tmp.endswith(".") or tmp.endswith("?") else tmp
+            _tmp = ""
+            for block in tmp.split("."):
+                if block.startswith(" "):
+                    _tmp += ". " + block[1].upper() + block[2:]
+                else:
+                    _tmp += block
+            tmp = _tmp
             print(tmp)
             title = "# " + tmp_t.split("]")[0][1:] + "\n"
             output += title + tmp + "\n"
