@@ -27,12 +27,13 @@ def convert_seconds_to_HHMMSS(seconds):
     seconds = seconds % 60
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
-def get_youtube_video_title(id):
+def get_youtube_video_info(id):
     url = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s" % id
     r = requests.get(url)
     j = json.loads(r.content)
-    return j['title'].replace(":", " - ").replace("/", "-")
+    return j
 
+header = get_youtube_video_info(ytb_id)
 
 tmp = None
 tmp_t = None
@@ -53,9 +54,13 @@ for subtitle_id, line in enumerate(srt):
     else:
         tmp += " " + subtitle
 
-# print(output)
+header_info = "\n".join(["%s: %s" % (k, header[k]) for k in header])
+thumbnail_url = "![](%s)" % header['thumbnail_url']
+output = "---\n%s\n---\n%s\n" % (header_info, thumbnail_url) + output
 print("The output content is ready")
-output_file = output_dir + '/SRT - %s.md' % get_youtube_video_title(ytb_id)
+
+output_file = output_dir + '/SRT - %s.md' % header['title'].replace(":", " - ").replace("/", "-")
 with open(output_file , "w") as f:
     f.write(output)
+
 print("Finished: " + output_file)
