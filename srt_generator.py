@@ -1,28 +1,21 @@
 import argparse
 import html
-import inspect
 import re
 import sys
 import urllib.parse
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence
 
 import requests
 
 
 DEFAULT_TIMEOUT = 15
-YOUTUBE_DOMAINS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
-BILIBILI_DOMAINS = {
-    "bilibili.com",
-    "www.bilibili.com",
-    "m.bilibili.com",
-    "b23.tv",
-    "www.b23.tv",
-    "bili2233.cn",
-    "www.bili2233.cn",
-}
 INVALID_FILENAME_CHARS = r'<>:"/\|?*'
+WATCH_URL = "https://www.youtube.com/watch?v={video_id}"
+PLAYER_API_URL = "https://www.youtube.com/youtubei/v1/player?key={api_key}"
+ANDROID_CONTEXT = {"client": {"clientName": "ANDROID", "clientVersion": "20.10.38"}}
 
 
 class SubtitleDownloadError(RuntimeError):
@@ -38,27 +31,19 @@ class SubtitleEntry:
 
 @dataclass
 class VideoMetadata:
-    platform: str
     title: str
     author: str
     thumbnail_url: str
     source_url: str
     source_id: str
-    extra: Dict[str, str]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download subtitles from YouTube or Bilibili and render them as Markdown."
+        description="Download YouTube subtitles and render them as Markdown."
     )
-    parser.add_argument("video_link", help="YouTube or Bilibili video URL")
+    parser.add_argument("youtube_link", help="YouTube video URL or 11-character video id")
     parser.add_argument("output_dir", help="Output directory for the generated Markdown file")
-    parser.add_argument(
-        "--platform",
-        choices=("auto", "youtube", "bilibili"),
-        default="auto",
-        help="Platform override. Default: auto detect from URL.",
-    )
     parser.add_argument(
         "--language",
         action="append",
@@ -72,16 +57,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many caption fragments to merge into one Markdown section. Default: 10.",
     )
     parser.add_argument("--proxy-https", help="HTTPS proxy URL")
-    parser.add_argument(
-        "--preserve-formatting",
-        action="store_true",
-        help="Preserve formatting when the source adapter supports it.",
-    )
-    parser.add_argument(
-        "--skip-punctuation",
-        action="store_true",
-        help="Skip punctuation restoration even if the model is installed.",
-    )
     return parser
 
 
@@ -103,27 +78,13 @@ def build_session(proxy_https: Optional[str]) -> requests.Session:
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/133.0.0.0 Safari/537.36"
-            )
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         }
     )
     if proxy_https:
         session.proxies.update({"http": proxy_https, "https": proxy_https})
     return session
-
-
-def detect_platform(video_link: str) -> str:
-    parsed = urllib.parse.urlparse(video_link)
-    host = parsed.netloc.lower()
-    if not host:
-        if re.fullmatch(r"[\w-]{11}", video_link):
-            return "youtube"
-        raise SubtitleDownloadError(f"Cannot detect platform from input: {video_link}")
-
-    if host in YOUTUBE_DOMAINS:
-        return "youtube"
-    if host in BILIBILI_DOMAINS:
-        return "bilibili"
-    raise SubtitleDownloadError(f"Unsupported host: {host}")
 
 
 def collapse_whitespace(text: str) -> str:
@@ -155,26 +116,18 @@ def format_timestamp_label(seconds: float) -> str:
     return format_timestamp(seconds).replace(",", ".")
 
 
-def build_timestamp_url(platform: str, source_url: str, seconds: float) -> str:
+def build_timestamp_url(source_url: str, seconds: float) -> str:
     start_seconds = max(0, int(seconds))
     parsed = urllib.parse.urlparse(source_url)
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-
-    if platform == "youtube":
-        query["t"] = [str(start_seconds)]
-        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
-
-    if platform == "bilibili":
-        query["t"] = [str(start_seconds)]
-        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
-
-    return source_url
+    query["t"] = [str(start_seconds)]
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
 
 
 def build_frontmatter(metadata: VideoMetadata, subtitle_language: Optional[str]) -> str:
     fields = {
         "title": metadata.title,
-        "platform": metadata.platform,
+        "platform": "youtube",
         "source_url": metadata.source_url,
         "source_id": metadata.source_id,
         "author": metadata.author,
@@ -183,7 +136,6 @@ def build_frontmatter(metadata: VideoMetadata, subtitle_language: Optional[str])
         fields["thumbnail_url"] = metadata.thumbnail_url
     if subtitle_language:
         fields["subtitle_language"] = subtitle_language
-    fields.update({key: value for key, value in metadata.extra.items() if value})
 
     lines = ["---"]
     for key, value in fields.items():
@@ -191,53 +143,6 @@ def build_frontmatter(metadata: VideoMetadata, subtitle_language: Optional[str])
         lines.append(f'{key}: "{escaped}"')
     lines.append("---")
     return "\n".join(lines)
-
-
-def load_punctuation_model(skip_punctuation: bool):
-    if skip_punctuation:
-        return None
-
-    try:
-        from deepmultilingualpunctuation import PunctuationModel
-    except ImportError:
-        return None
-
-    try:
-        return PunctuationModel()
-    except Exception:
-        return None
-
-
-def apply_punctuation(text: str, model) -> str:
-    if model is None or not text:
-        return text
-
-    try:
-        punctuated = model.restore_punctuation(text)
-    except Exception:
-        return text
-
-    punctuated = normalize_text(punctuated)
-    if punctuated and punctuated[0].islower():
-        punctuated = punctuated[0].upper() + punctuated[1:]
-    return punctuated
-
-
-def transcript_item_to_entry(item) -> SubtitleEntry:
-    if isinstance(item, dict):
-        start = item.get("start", 0.0)
-        duration = item.get("duration", 0.0)
-        text = item.get("text", "")
-    else:
-        start = getattr(item, "start", 0.0)
-        duration = getattr(item, "duration", 0.0)
-        text = getattr(item, "text", "")
-
-    return SubtitleEntry(
-        start=float(start or 0.0),
-        duration=float(duration or 0.0),
-        text=normalize_text(str(text or "")),
-    )
 
 
 def chunk_entries(entries: Sequence[SubtitleEntry], group_size: int) -> Iterable[List[SubtitleEntry]]:
@@ -259,7 +164,6 @@ def render_markdown(
     entries: Sequence[SubtitleEntry],
     subtitle_language: Optional[str],
     group_size: int,
-    punctuation_model,
 ) -> str:
     frontmatter = build_frontmatter(metadata, subtitle_language)
     lines = [frontmatter, "", f"# {metadata.title}", ""]
@@ -272,18 +176,13 @@ def render_markdown(
     lines.append(f"Author: {metadata.author}")
     if subtitle_language:
         lines.append(f"Subtitle language: {subtitle_language}")
-    for key, value in metadata.extra.items():
-        if value:
-            label = key.replace("_", " ").title()
-            lines.append(f"{label}: {value}")
     lines.append("")
 
     for chunk in chunk_entries(entries, group_size):
         start_seconds = chunk[0].start
         timestamp_label = format_timestamp_label(start_seconds)
-        timestamp_url = build_timestamp_url(metadata.platform, metadata.source_url, start_seconds)
+        timestamp_url = build_timestamp_url(metadata.source_url, start_seconds)
         merged_text = normalize_text(" ".join(entry.text for entry in chunk))
-        merged_text = apply_punctuation(merged_text, punctuation_model)
         if not merged_text:
             continue
 
@@ -294,18 +193,12 @@ def render_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def request_json(session: requests.Session, url: str, **kwargs) -> dict:
-    response = session.get(url, timeout=DEFAULT_TIMEOUT, **kwargs)
-    response.raise_for_status()
-    return response.json()
-
-
-def extract_youtube_video_id(video_link: str) -> str:
-    direct_id = video_link.strip()
+def extract_youtube_video_id(youtube_link: str) -> str:
+    direct_id = youtube_link.strip()
     if re.fullmatch(r"[\w-]{11}", direct_id):
         return direct_id
 
-    parsed = urllib.parse.urlparse(video_link)
+    parsed = urllib.parse.urlparse(youtube_link)
     host = parsed.netloc.lower()
     path = parsed.path.strip("/")
     query = urllib.parse.parse_qs(parsed.query)
@@ -324,322 +217,175 @@ def extract_youtube_video_id(video_link: str) -> str:
             if re.fullmatch(r"[\w-]{11}", candidate):
                 return candidate
 
-    raise SubtitleDownloadError(f"Could not extract YouTube video id from: {video_link}")
+    raise SubtitleDownloadError(f"Could not extract YouTube video id from: {youtube_link}")
 
 
-def get_youtube_metadata(session: requests.Session, video_id: str) -> VideoMetadata:
+def extract_innertube_api_key(watch_html: str) -> str:
+    match = re.search(r'"INNERTUBE_API_KEY":\s*"([a-zA-Z0-9_-]+)"', watch_html)
+    if match is None:
+        raise SubtitleDownloadError("Could not extract INNERTUBE_API_KEY from the YouTube watch page.")
+    return match.group(1)
+
+
+def create_consent_cookie(session: requests.Session, watch_html: str) -> None:
+    match = re.search(r'name="v" value="(.*?)"', watch_html)
+    if match is None:
+        raise SubtitleDownloadError("YouTube returned a consent page and the consent token could not be extracted.")
+    session.cookies.set("CONSENT", "YES+" + match.group(1), domain=".youtube.com")
+
+
+def fetch_watch_html(session: requests.Session, video_id: str) -> str:
+    response = session.get(WATCH_URL.format(video_id=video_id), timeout=DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    watch_html = html.unescape(response.text)
+
+    if 'action="https://consent.youtube.com/s"' in watch_html:
+        create_consent_cookie(session, watch_html)
+        response = session.get(WATCH_URL.format(video_id=video_id), timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        watch_html = html.unescape(response.text)
+        if 'action="https://consent.youtube.com/s"' in watch_html:
+            raise SubtitleDownloadError("YouTube consent page could not be bypassed.")
+
+    return watch_html
+
+
+def fetch_player_response(session: requests.Session, video_id: str) -> dict:
+    watch_html = fetch_watch_html(session, video_id)
+    api_key = extract_innertube_api_key(watch_html)
+    response = session.post(
+        PLAYER_API_URL.format(api_key=api_key),
+        json={"context": ANDROID_CONTEXT, "videoId": video_id},
+        timeout=DEFAULT_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def flatten_runs(runs: Sequence[dict]) -> str:
+    return "".join(str(run.get("text", "")) for run in runs)
+
+
+def get_text_value(value) -> str:
+    if isinstance(value, dict):
+        if "simpleText" in value:
+            return str(value["simpleText"])
+        if "runs" in value:
+            return flatten_runs(value["runs"])
+    return str(value or "")
+
+
+def get_thumbnail_url(video_details: dict) -> str:
+    thumbnails = (((video_details.get("thumbnail") or {}).get("thumbnails")) or [])
+    if not thumbnails:
+        return ""
+    return str(thumbnails[-1].get("url", ""))
+
+
+def get_youtube_metadata(player_response: dict, video_id: str) -> VideoMetadata:
+    video_details = player_response.get("videoDetails") or {}
+    microformat = ((player_response.get("microformat") or {}).get("playerMicroformatRenderer")) or {}
     source_url = f"https://www.youtube.com/watch?v={video_id}"
-    title = video_id
-    author = "Unknown"
-    thumbnail_url = ""
+    title = video_details.get("title") or microformat.get("title") or video_id
+    author = video_details.get("author") or microformat.get("ownerChannelName") or "Unknown"
+    thumbnail_url = get_thumbnail_url(video_details)
 
-    try:
-        payload = request_json(
-            session,
-            "https://www.youtube.com/oembed",
-            params={"url": source_url, "format": "json"},
-        )
-        title = payload.get("title") or title
-        author = payload.get("author_name") or author
-        thumbnail_url = payload.get("thumbnail_url") or thumbnail_url
-    except requests.RequestException:
-        pass
+    if not thumbnail_url:
+        thumbnails = microformat.get("thumbnail", {}).get("thumbnails", [])
+        if thumbnails:
+            thumbnail_url = str(thumbnails[-1].get("url", ""))
 
     return VideoMetadata(
-        platform="youtube",
-        title=title,
-        author=author,
+        title=str(title),
+        author=str(author),
         thumbnail_url=thumbnail_url,
         source_url=source_url,
         source_id=video_id,
-        extra={},
     )
 
 
-def build_youtube_client(session: requests.Session, proxy_https: Optional[str]):
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError as exc:
-        raise SubtitleDownloadError(
-            "youtube-transcript-api is not installed. Install dependencies first."
-        ) from exc
-
-    init_signature = inspect.signature(YouTubeTranscriptApi)
-    init_kwargs = {}
-
-    if "http_client" in init_signature.parameters:
-        init_kwargs["http_client"] = session
-
-    if proxy_https and "proxy_config" in init_signature.parameters:
-        try:
-            from youtube_transcript_api.proxies import GenericProxyConfig
-        except ImportError:
-            GenericProxyConfig = None
-        if GenericProxyConfig is not None:
-            init_kwargs["proxy_config"] = GenericProxyConfig(
-                http_url=proxy_https,
-                https_url=proxy_https,
-            )
-
-    try:
-        return YouTubeTranscriptApi(**init_kwargs)
-    except TypeError:
-        return YouTubeTranscriptApi()
-
-
-def choose_youtube_transcript(transcript_list) -> object:
-    transcripts = list(transcript_list)
-    if not transcripts:
+def get_caption_tracks(player_response: dict) -> List[dict]:
+    captions = player_response.get("captions") or {}
+    renderer = captions.get("playerCaptionsTracklistRenderer") or {}
+    tracks = renderer.get("captionTracks") or []
+    if not tracks:
         raise SubtitleDownloadError("No subtitles are available for this YouTube video.")
-
-    transcripts.sort(key=lambda item: getattr(item, "is_generated", False))
-    return transcripts[0]
+    return list(tracks)
 
 
-def fetch_youtube_legacy_transcript(client, video_id: str, kwargs: dict):
-    if kwargs.get("languages"):
-        legacy_api = getattr(type(client), "get_transcript", None)
-        if legacy_api is None:
-            raise SubtitleDownloadError("Unsupported youtube-transcript-api version.")
-        return legacy_api(video_id, **kwargs), kwargs["languages"][0]
-
-    list_transcripts = getattr(type(client), "list_transcripts", None)
-    if list_transcripts is not None:
-        try:
-            transcript = choose_youtube_transcript(list_transcripts(video_id))
-            selected_language = getattr(transcript, "language_code", None)
-            return transcript.fetch(), selected_language
-        except Exception as exc:
-            raise SubtitleDownloadError(f"Failed to fetch YouTube subtitles: {exc}") from exc
-
-    legacy_api = getattr(type(client), "get_transcript", None)
-    if legacy_api is None:
-        raise SubtitleDownloadError("Unsupported youtube-transcript-api version.")
-    return legacy_api(video_id, **kwargs), None
-
-
-def fetch_youtube_entries(
-    session: requests.Session,
-    video_id: str,
-    languages: Sequence[str],
-    preserve_formatting: bool,
-    proxy_https: Optional[str],
-) -> Tuple[List[SubtitleEntry], Optional[str]]:
-    client = build_youtube_client(session, proxy_https)
-
-    if hasattr(client, "fetch"):
-        try:
-            if languages:
-                fetched = client.fetch(
-                    video_id,
-                    languages=list(languages),
-                    preserve_formatting=preserve_formatting,
-                )
-                selected_language = languages[0]
-            else:
-                transcript = choose_youtube_transcript(client.list(video_id))
-                selected_language = getattr(transcript, "language_code", None)
-                fetched = transcript.fetch(preserve_formatting=preserve_formatting)
-        except Exception as exc:
-            raise SubtitleDownloadError(f"Failed to fetch YouTube subtitles: {exc}") from exc
-
-        selected_language = getattr(fetched, "language_code", selected_language)
-        entries = [transcript_item_to_entry(item) for item in fetched]
-        entries = [entry for entry in entries if entry.text]
-        return entries, selected_language
-
-    kwargs = {"preserve_formatting": preserve_formatting}
-    if languages:
-        kwargs["languages"] = list(languages)
-    if proxy_https:
-        kwargs["proxies"] = {"http": proxy_https, "https": proxy_https}
-
-    try:
-        fetched, selected_language = fetch_youtube_legacy_transcript(client, video_id, kwargs)
-    except Exception as exc:
-        raise SubtitleDownloadError(f"Failed to fetch YouTube subtitles: {exc}") from exc
-
-    entries = [transcript_item_to_entry(item) for item in fetched]
-    entries = [entry for entry in entries if entry.text]
-    return entries, selected_language
-
-
-def resolve_bilibili_short_url(session: requests.Session, video_link: str) -> str:
-    response = session.get(video_link, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    return response.url
-
-
-def parse_bilibili_reference(video_link: str) -> Tuple[Dict[str, str], int]:
-    parsed = urllib.parse.urlparse(video_link)
-    query = urllib.parse.parse_qs(parsed.query)
-    page_raw = query.get("p", ["1"])[0] or "1"
-    try:
-        page_number = int(page_raw)
-    except ValueError as exc:
-        raise SubtitleDownloadError(f"Invalid Bilibili page number: {page_raw}") from exc
-
-    path = parsed.path
-    bvid_match = re.search(r"/video/(BV[\w]+)", path, flags=re.IGNORECASE)
-    if bvid_match:
-        return {"bvid": bvid_match.group(1)}, page_number
-
-    aid_match = re.search(r"/video/av(\d+)", path, flags=re.IGNORECASE)
-    if aid_match:
-        return {"aid": aid_match.group(1)}, page_number
-
-    raise SubtitleDownloadError(f"Could not extract Bilibili video id from: {video_link}")
-
-
-def fetch_bilibili_video_data(
-    session: requests.Session,
-    reference: Dict[str, str],
-) -> dict:
-    payload = request_json(
-        session,
-        "https://api.bilibili.com/x/web-interface/view",
-        params=reference,
-    )
-    if payload.get("code") != 0 or "data" not in payload:
-        raise SubtitleDownloadError(
-            f"Bilibili video info request failed: {payload.get('message') or payload.get('msg') or payload}"
-        )
-    return payload["data"]
-
-
-def select_bilibili_page(video_data: dict, page_number: int) -> dict:
-    pages = video_data.get("pages") or []
-    if not pages:
-        raise SubtitleDownloadError("Bilibili video has no page information.")
-
-    if page_number < 1 or page_number > len(pages):
-        raise SubtitleDownloadError(
-            f"Bilibili page index out of range: p={page_number}, total={len(pages)}"
-        )
-    return pages[page_number - 1]
-
-
-def choose_bilibili_subtitle(subtitles: Sequence[dict], languages: Sequence[str]) -> dict:
-    if not subtitles:
-        raise SubtitleDownloadError("No published subtitles were found for this Bilibili video.")
-
+def choose_caption_track(tracks: Sequence[dict], languages: Sequence[str]) -> dict:
     if not languages:
-        return subtitles[0]
+        ordered_tracks = sorted(tracks, key=lambda track: track.get("kind") == "asr")
+        return ordered_tracks[0]
 
     normalized_languages = {language.lower() for language in languages}
-    for subtitle in subtitles:
-        lan = str(subtitle.get("lan", "")).lower()
-        lan_doc = str(subtitle.get("lan_doc", "")).lower()
-        if (
-            lan in normalized_languages
-            or lan_doc in normalized_languages
-            or any(language in lan_doc for language in normalized_languages)
-        ):
-            return subtitle
+    for language in normalized_languages:
+        for track in tracks:
+            language_code = str(track.get("languageCode", "")).lower()
+            name = get_text_value(track.get("name")).lower()
+            vss_id = str(track.get("vssId", "")).lower()
+            if (
+                language == language_code
+                or language == vss_id.lstrip(".")
+                or language in name
+                or language_code.startswith(language + "-")
+            ):
+                return track
 
     available = ", ".join(
-        collapse_whitespace(f"{subtitle.get('lan')} ({subtitle.get('lan_doc', '')})")
-        for subtitle in subtitles
+        f"{track.get('languageCode', 'unknown')} ({get_text_value(track.get('name')) or 'unnamed'})"
+        for track in tracks
     )
     raise SubtitleDownloadError(
         f"Requested subtitle language was not found. Available tracks: {available}"
     )
 
 
-def normalize_bilibili_subtitle_url(url: str) -> str:
-    if url.startswith("//"):
-        return "https:" + url
-    return url
+def build_caption_download_url(base_url: str) -> str:
+    return base_url.replace("&fmt=srv3", "")
 
 
-def get_bilibili_metadata(video_data: dict, page: dict, page_number: int) -> VideoMetadata:
-    bvid = video_data.get("bvid")
-    canonical_url = f"https://www.bilibili.com/video/{bvid}"
-    if page_number > 1:
-        canonical_url += f"?p={page_number}"
-
-    extra: Dict[str, str] = {}
-    part = page.get("part")
-    if part and part != video_data.get("title"):
-        extra["part"] = str(part)
-
-    return VideoMetadata(
-        platform="bilibili",
-        title=video_data.get("title") or bvid,
-        author=((video_data.get("owner") or {}).get("name") or "Unknown"),
-        thumbnail_url=video_data.get("pic") or "",
-        source_url=canonical_url,
-        source_id=bvid or str(video_data.get("aid")),
-        extra=extra,
-    )
+def parse_caption_xml(xml_text: str) -> List[SubtitleEntry]:
+    root = ET.fromstring(xml_text)
+    entries: List[SubtitleEntry] = []
+    for node in root.findall(".//text") + root.findall(".//p"):
+        text = normalize_text("".join(node.itertext()))
+        if not text:
+            continue
+        if "start" in node.attrib:
+            start = float(node.attrib.get("start", "0") or 0.0)
+            duration = float(node.attrib.get("dur", "0") or 0.0)
+        else:
+            start = float(node.attrib.get("t", "0") or 0.0) / 1000.0
+            duration = float(node.attrib.get("d", "0") or 0.0) / 1000.0
+        entries.append(SubtitleEntry(start=start, duration=duration, text=text))
+    return entries
 
 
-def fetch_bilibili_entries(
-    session: requests.Session,
-    video_link: str,
-    languages: Sequence[str],
-) -> Tuple[VideoMetadata, List[SubtitleEntry], Optional[str]]:
-    parsed = urllib.parse.urlparse(video_link)
-    host = parsed.netloc.lower()
-    normalized_link = (
-        resolve_bilibili_short_url(session, video_link)
-        if host in {"b23.tv", "www.b23.tv", "bili2233.cn", "www.bili2233.cn"}
-        else video_link
-    )
+def fetch_caption_entries(session: requests.Session, track: dict) -> List[SubtitleEntry]:
+    caption_url = build_caption_download_url(str(track.get("baseUrl", "")))
+    if not caption_url:
+        raise SubtitleDownloadError("YouTube returned a subtitle track without baseUrl.")
 
-    reference, page_number = parse_bilibili_reference(normalized_link)
-    video_data = fetch_bilibili_video_data(session, reference)
-    page = select_bilibili_page(video_data, page_number)
-
-    player_payload = request_json(
-        session,
-        "https://api.bilibili.com/x/player/v2",
-        params={"cid": page["cid"], **reference},
-    )
-    if player_payload.get("code") != 0 or "data" not in player_payload:
-        raise SubtitleDownloadError(
-            f"Bilibili subtitle info request failed: {player_payload.get('message') or player_payload.get('msg') or player_payload}"
-        )
-
-    subtitle_info = ((player_payload.get("data") or {}).get("subtitle") or {})
-    subtitle_track = choose_bilibili_subtitle(subtitle_info.get("subtitles") or [], languages)
-    subtitle_language = subtitle_track.get("lan_doc") or subtitle_track.get("lan")
-    subtitle_url = normalize_bilibili_subtitle_url(subtitle_track.get("subtitle_url", ""))
-    if not subtitle_url:
-        raise SubtitleDownloadError("Bilibili returned a subtitle track without subtitle_url.")
-
-    subtitle_payload = request_json(session, subtitle_url)
-    body = subtitle_payload.get("body") or []
-    entries = [
-        SubtitleEntry(
-            start=float(item.get("from", 0.0)),
-            duration=max(0.0, float(item.get("to", 0.0)) - float(item.get("from", 0.0))),
-            text=normalize_text(str(item.get("content", ""))),
-        )
-        for item in body
-        if item.get("content")
-    ]
-
-    metadata = get_bilibili_metadata(video_data, page, page_number)
-    return metadata, entries, subtitle_language
+    response = session.get(caption_url, timeout=DEFAULT_TIMEOUT)
+    response.raise_for_status()
+    if not response.text.strip():
+        raise SubtitleDownloadError("YouTube returned an empty subtitle response for the selected track.")
+    return parse_caption_xml(response.text)
 
 
 def fetch_youtube_data(
     session: requests.Session,
-    video_link: str,
+    youtube_link: str,
     languages: Sequence[str],
-    preserve_formatting: bool,
-    proxy_https: Optional[str],
-) -> Tuple[VideoMetadata, List[SubtitleEntry], Optional[str]]:
-    video_id = extract_youtube_video_id(video_link)
-    metadata = get_youtube_metadata(session, video_id)
-    entries, subtitle_language = fetch_youtube_entries(
-        session=session,
-        video_id=video_id,
-        languages=languages,
-        preserve_formatting=preserve_formatting,
-        proxy_https=proxy_https,
-    )
+) -> tuple[VideoMetadata, List[SubtitleEntry], Optional[str]]:
+    video_id = extract_youtube_video_id(youtube_link)
+    player_response = fetch_player_response(session, video_id)
+    metadata = get_youtube_metadata(player_response, video_id)
+    tracks = get_caption_tracks(player_response)
+    selected_track = choose_caption_track(tracks, languages)
+    subtitle_language = str(selected_track.get("languageCode") or "") or None
+    entries = fetch_caption_entries(session, selected_track)
     return metadata, entries, subtitle_language
 
 
@@ -658,37 +404,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     languages = normalize_languages(args.language)
     session = build_session(args.proxy_https)
-    punctuation_model = load_punctuation_model(args.skip_punctuation)
 
     try:
-        platform = args.platform if args.platform != "auto" else detect_platform(args.video_link)
-
-        if platform == "youtube":
-            metadata, entries, subtitle_language = fetch_youtube_data(
-                session=session,
-                video_link=args.video_link,
-                languages=languages,
-                preserve_formatting=args.preserve_formatting,
-                proxy_https=args.proxy_https,
-            )
-        elif platform == "bilibili":
-            metadata, entries, subtitle_language = fetch_bilibili_entries(
-                session=session,
-                video_link=args.video_link,
-                languages=languages,
-            )
-        else:
-            raise SubtitleDownloadError(f"Unsupported platform: {platform}")
-
+        metadata, entries, subtitle_language = fetch_youtube_data(
+            session=session,
+            youtube_link=args.youtube_link,
+            languages=languages,
+        )
         if not entries:
             raise SubtitleDownloadError("Subtitle track was found, but it contains no usable text.")
-
         markdown = render_markdown(
             metadata=metadata,
             entries=entries,
             subtitle_language=subtitle_language,
             group_size=args.group_size,
-            punctuation_model=punctuation_model,
         )
         output_path = write_output(args.output_dir, metadata, markdown)
     except SubtitleDownloadError as exc:

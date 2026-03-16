@@ -1,5 +1,1 @@
 requests
-youtube-transcript-api
-deepmultilingualpunctuation
-sentencepiece
-protobuf
